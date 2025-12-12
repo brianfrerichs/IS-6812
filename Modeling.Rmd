@@ -1,0 +1,403 @@
+---
+title: "Modeling IS6812"
+author: "Brian Frerichs"
+date: "2025-10-25"
+output: 
+  html_document:
+    toc: true
+    
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+
+****Business Problem
+The Business problem is that Home Credit wants to be able to accurately predict potential new client’s abilities to repay loans. Home Credit hopes to provide a positive lending experience to the unbaked by sheltering them from predatory lending arrangements. 
+
+****Benefit of a Solution
+If they are able to minimize the amount of loans given out that the client is unable to repay, then Home Credit will minimize their own financial risk and the unbanked population will be in a better financial state.
+
+****Success Metrics
+The success metric will be the area under the ROC curve, which is a measurement of how accurate our classifier is. An AUC of 1 indicates a perfect classifier, while an AUC of .5 indicates that our model is no better than a random classifier. So in this case an AUC closer to 1 indicates that our model successfully predicts who will and will not repay loans.
+
+****Analytics Approach
+This is a supervised learning problem, and the target variable is whether the loan was repaid. This is a classification problem. 
+
+
+# Load packages, and clean data
+```{r}
+
+
+library(tidyverse)
+library(caret)
+library(pROC)
+library(janitor)
+library(readr)
+library(dplyr)
+library(caret)
+library(e1071)
+
+application_train <- read_csv("application_train.csv")
+
+
+## trim data set to only include most important predictors
+
+application_train_slim <- application_train %>%
+  select(TARGET, CNT_CHILDREN, AMT_INCOME_TOTAL,AMT_CREDIT,AMT_ANNUITY,NAME_INCOME_TYPE,DAYS_BIRTH,DAYS_EMPLOYED,OCCUPATION_TYPE,CNT_FAM_MEMBERS,EXT_SOURCE_1,EXT_SOURCE_2,EXT_SOURCE_3)
+
+
+## I chose to create a new column called employment duration that bins the DAYS_EMPLOYED column and handles the special 365243 value
+
+APP_TRAIN_BIN_EMPLOYMENT <- application_train_slim %>%
+  mutate(
+    EMPLOYMENT_DURATION = case_when(
+      DAYS_EMPLOYED == 365243 & NAME_INCOME_TYPE == "Pensioner" ~ "Pensioner",
+      DAYS_EMPLOYED == 365243 & NAME_INCOME_TYPE == "Unemployed" ~ "Unemployed",
+      DAYS_EMPLOYED > -365 ~ "Short Term",
+      DAYS_EMPLOYED <= -365 & DAYS_EMPLOYED >= -1825 ~ "Medium Term",
+      TRUE ~ "Long Term" # Default case if no other conditions are met
+    )
+  )
+
+## Drop the rows where AMT_ANNUITY is blank because there are only a few
+
+DROP_BLANKS <- APP_TRAIN_BIN_EMPLOYMENT %>%
+  filter(!is.na(AMT_ANNUITY))
+
+
+## Drop the rows where CNT_FAM_MEMBERS is blank because there are only a few
+
+DROP_BLANKS <- DROP_BLANKS %>%
+  filter(!is.na(CNT_FAM_MEMBERS))
+  
+
+
+## Replace NA's in OCCUPATION_TYPE with an "Unavailable"
+
+FIX_EMPLOYMENT <- DROP_BLANKS %>%
+  mutate(
+    OCCUPATION_TYPE = case_when(
+      is.na(OCCUPATION_TYPE) ~ "Unavailable",
+      TRUE ~ OCCUPATION_TYPE
+    )
+  )
+
+
+## Do median imputation for the missing risk score values
+
+risk_scores <- FIX_EMPLOYMENT[, c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")]
+
+
+for (col in names(risk_scores)) {
+  # Convert to numeric if not already
+  risk_scores[[col]] <- as.numeric(risk_scores[[col]])
+  
+  # Replace NA with median
+  if (is.numeric(risk_scores[[col]])) {
+    median_value <- median(risk_scores[[col]], na.rm = TRUE)
+    risk_scores[[col]][is.na(risk_scores[[col]])] <- median_value
+  }
+}
+
+FIX_EMPLOYMENT[, c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")] <- risk_scores
+
+CLEAN_TRAIN <- clean_names(FIX_EMPLOYMENT) # This is our final clean data set
+
+
+
+```
+
+
+
+
+
+# Perform factorization of target variable, and split data into train and test set
+```{r}
+## look at proportions of the target variable
+
+CLEAN_TRAIN |>
+     count(target) |>
+     mutate(perc = n/sum(n)) 
+
+## convert employment duration to a factor
+CLEAN_TRAIN$employment_duration <- factor(CLEAN_TRAIN$employment_duration)
+
+
+
+## set seed for reproducibility
+
+set.seed(12345)
+
+## split training data into a train set and a model validation set
+
+index_numbers_split <- createDataPartition(CLEAN_TRAIN$target,p=.7,list = FALSE)
+
+model_tr <- CLEAN_TRAIN[index_numbers_split,]
+model_val <- CLEAN_TRAIN[-index_numbers_split,]
+
+
+
+```
+
+# Fit a baseline model and a glm model
+```{r}
+# Fit logistic regression model w intercept only
+(model1 <- glm(target ~ 1, 
+               data = model_tr, 
+               family = binomial)) %>% 
+     summary() ## AIC 120383
+
+auc_null <- roc(response = model_tr$target, predictor = predict(model1, type = "response"))
+auc_null ## 0.5, totally random
+
+
+
+# Convert target to factor with appropriate labels
+model_tr$target <- factor(ifelse(model_tr$target == 0, "no_default", "default"),
+                          levels = c("no_default", "default"))
+
+model_val$target <- factor(ifelse(model_val$target == 0, "no_default", "default"),
+                          levels = c("no_default", "default"))
+
+# Fit our logistic regression model
+caret_glm <- train(
+  target ~ amt_income_total +
+           amt_annuity +
+           amt_credit +
+           ext_source_1 +
+           ext_source_2 +
+           ext_source_3 +
+           days_birth +
+           employment_duration,
+  method = "glm",
+  family = "binomial",   # binary target
+  trControl = trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,    
+    sampling = "down"   # down sample the majority class
+  ),
+  data = model_tr,
+  metric = "ROC"
+)
+
+summary(caret_glm)
+
+
+# ROC for training set
+train_probs <- predict(caret_glm, newdata = model_tr, type = "prob")[, "default"]
+roc_train <- roc(response = model_tr$target, predictor = train_probs)
+cat("Train AUC:", auc(roc_train), "\n")
+
+# ROC for test set
+test_probs <- predict(caret_glm, newdata = model_val, type = "prob")[, "default"]
+roc_test <- roc(response = model_val$target, predictor = test_probs)
+cat("Test AUC:", auc(roc_test), "\n")
+
+# Plot both ROC curves
+plot(roc_train, col = "blue", main = "ROC Curves")
+lines(roc_test, col = "red")
+legend("bottomright", legend = c("Train", "Test"), col = c("blue", "red"), lwd = 2)
+
+```
+
+# Random Forest
+```{r}
+
+
+# Random Forest
+
+caret_rf <- train(
+  target ~ amt_income_total +
+           amt_annuity +
+           amt_credit +
+           ext_source_1 +
+           ext_source_2 +
+           ext_source_3 +
+           days_birth +
+           employment_duration,,
+  method = "ranger",   # Fast Random Forest
+  trControl = trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    sampling = "down"
+  ),
+  data = model_tr,
+  metric = "ROC"
+)
+
+summary(caret_rf)
+
+
+# ROC for training set
+train_probs <- predict(caret_rf, newdata = model_tr, type = "prob")[, "default"]
+roc_train <- roc(response = model_tr$target, predictor = train_probs)
+cat("Train AUC:", auc(roc_train), "\n")
+
+# ROC for test set
+test_probs <- predict(caret_rf, newdata = model_val, type = "prob")[, "default"]
+roc_test <- roc(response = model_val$target, predictor = test_probs)
+cat("Test AUC:", auc(roc_test), "\n")
+
+# Optional: Plot both ROC curves
+plot(roc_train, col = "blue", main = "ROC Curves")
+lines(roc_test, col = "red")
+legend("bottomright", legend = c("Train", "Test"), col = c("blue", "red"), lwd = 2)
+
+# ROC for training set
+train_probs <- predict(caret_rf, newdata = model_tr, type = "prob")[, "default"]
+roc_train <- roc(response = model_tr$target, predictor = train_probs)
+cat("Train AUC:", auc(roc_train), "\n")
+
+# ROC for test set
+test_probs <- predict(caret_rf, newdata = model_val, type = "prob")[, "default"]
+roc_test <- roc(response = model_val$target, predictor = test_probs)
+cat("Test AUC:", auc(roc_test), "\n")
+
+# Plot both ROC curves
+plot(roc_train, col = "blue", main = "ROC Curves")
+lines(roc_test, col = "red")
+legend("bottomright", legend = c("Train", "Test"), col = c("blue", "red"), lwd = 2)
+
+
+
+
+```
+
+
+
+# Gradient Boost
+```{r}
+library(gbm)
+
+# Gradient Boosting Machine
+
+caret_xgb <- train(
+  target ~ .,
+  method = "gbm",
+  trControl = trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    sampling = "down"
+  ),
+  data = model_tr,
+  metric = "ROC",
+  tuneLength = 5
+)
+
+summary(caret_xgb)
+view(caret_xgb)
+
+
+# ROC for training set
+train_probs <- predict(caret_xgb, newdata = model_tr, type = "prob")[, "default"]
+roc_train <- roc(response = model_tr$target, predictor = train_probs)
+cat("Train AUC:", auc(roc_train), "\n")
+
+# ROC for test set
+test_probs <- predict(caret_xgb, newdata = model_val, type = "prob")[, "default"]
+roc_test <- roc(response = model_val$target, predictor = test_probs)
+cat("Test AUC:", auc(roc_test), "\n")
+
+# Optional: Plot both ROC curves
+plot(roc_train, col = "blue", main = "ROC Curves")
+lines(roc_test, col = "red")
+legend("bottomright", legend = c("Train", "Test"), col = c("blue", "red"), lwd = 2)
+
+
+
+# Extract variable importance
+importance <- varImp(caret_xgb, scale = TRUE)
+
+# Convert to data frame for ggplot
+importance_df <- data.frame(
+  Feature = rownames(importance$importance),
+  Importance = importance$importance$Overall
+)
+
+# Plot of the most important predictors
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance (GBM Model)",
+       x = "Features",
+       y = "Importance Score") +
+  theme_minimal()
+
+```
+## While all of our models had comparable AUC's in the low 70's. The xgboostm model was the best by a little bit. The next step is to tranlate that AUC into actionable insights by helping the company visualize their profit and loss at different AUC thresholds. The inputs here are just for demonstration, and can be updated by Home Credit to match their actual experience.
+
+# P&L Table for different AUCs
+```{r}
+
+library(caret)
+library(ggplot2)
+
+# Get predicted probabilities
+preds <- predict(caret_glm, newdata = model_val, type = "prob")[, "default"]
+
+# Inspect actual target values
+table(model_val$target)
+
+# Recode actual target to match prediction labels
+# Adjust this mapping if your target is coded differently
+actual <- ifelse(model_val$target == "default", "default", "nondefault")
+actual <- factor(actual, levels = c("default","nondefault"))
+
+# Profit assumptions
+Revenue_TN <- 118800   # profit from correctly approving a non-defaulter, total interest from a 600K loan paid over 30 months at 15%
+Revenue_TP <- 0      # assume no profit from defaulters
+Cost_FN    <- -360000 # assumes 20% loan repayment before default, and a 25% recovery rate
+Cost_FP    <- -118800   # wrongly rejecting a good customer
+
+# Loop over thresholds
+thresholds <- seq(0, 1, by = 0.1)
+profit_table <- data.frame()
+
+for (t in thresholds) {
+  preds_class <- ifelse(preds > t, "default", "nondefault")
+  preds_class <- factor(preds_class, levels = c("default","nondefault"))
+  
+  # Debug check
+  print(table(preds_class, actual))
+  
+  cm <- confusionMatrix(preds_class, actual)
+  
+  TP <- cm$table["default","default"]
+  FP <- cm$table["default","nondefault"]
+  FN <- cm$table["nondefault","default"]
+  TN <- cm$table["nondefault","nondefault"]
+  
+  total_profit <- (TN * Revenue_TN) + (TP * Revenue_TP) + (FN * Cost_FN) + (FP * Cost_FP)
+  
+  profit_table <- rbind(profit_table,
+                        data.frame(threshold = t,
+                                   TP = TP, FP = FP, FN = FN, TN = TN,
+                                   total_profit = total_profit))
+}
+
+print(profit_table)  # This allows us to see the profit and loss at different thresholds along the AUC curve
+
+
+
+# Plot profit curve
+ggplot(profit_table, aes(x = threshold, y = total_profit)) +
+  geom_line(color = "darkgreen") +
+  geom_point(color = "orange") +
+  labs(title = "Profit Curve for GBM Model",
+       x = "Probability Threshold",
+       y = "Total Profit")
+
+
+
+```
